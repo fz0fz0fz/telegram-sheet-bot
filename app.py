@@ -37,10 +37,122 @@ COLUMNS = [
     "MODEL_NUMBER",
 ]
 
-REQUIRED_FIELDS = ["TAG_NUMBER", "DESCRIPTION_AR", "DESCRIPTION_L1", "DESCRIPTION_L2", "DESCRIPTION_L3"]
+# Keep it minimal (very tolerant)
+REQUIRED_FIELDS = ["TAG_NUMBER"]
 
-LINE_RE = re.compile(r"^\s*([A-Z_]+)\s*:\s*(.*)\s*$")
+# -----------------------
+# Very tolerant parsing
+# -----------------------
+SEP_CHARS = r":：﹕"  # ":" + fullwidth + common variants
+LINE_RE = re.compile(rf"^\s*([^ {SEP_CHARS}]+(?:\s+[^ {SEP_CHARS}]+)*)\s*[{SEP_CHARS}]\s*(.*)\s*$")
 
+KEY_ALIASES = {
+    # Department
+    "DEPARTMENT": "DEPARTMENT",
+    "القسم": "DEPARTMENT",
+
+    # Room
+    "ROOM_ID": "ROOM_ID",
+    "ROOM ID": "ROOM_ID",
+    "رقم الغرفة": "ROOM_ID",
+
+    "ROOM_NAME": "ROOM_NAME",
+    "ROOM NAME": "ROOM_NAME",
+    "اسم الغرفة": "ROOM_NAME",
+
+    # Tag
+    "TAG_NUMBER": "TAG_NUMBER",
+    "TAG NUMBER": "TAG_NUMBER",
+    "TAG": "TAG_NUMBER",
+    "TAG NO": "TAG_NUMBER",
+    "TAG#": "TAG_NUMBER",
+    "رقم التاق": "TAG_NUMBER",
+    "التاق": "TAG_NUMBER",
+    "تاق": "TAG_NUMBER",
+
+    # Descriptions
+    "DESCRIPTION_AR": "DESCRIPTION_AR",
+    "DESCRIPTION AR": "DESCRIPTION_AR",
+    "DESC AR": "DESCRIPTION_AR",
+    "الوصف عربي": "DESCRIPTION_AR",
+    "وصف عربي": "DESCRIPTION_AR",
+
+    "DESCRIPTION_EN": "DESCRIPTION_EN",
+    "DESCRIPTION EN": "DESCRIPTION_EN",
+    "DESC EN": "DESCRIPTION_EN",
+    "الوصف انجليزي": "DESCRIPTION_EN",
+    "وصف انجليزي": "DESCRIPTION_EN",
+
+    # Levels (many forms)
+    "DESCRIPTION_L1": "DESCRIPTION_L1",
+    "L1": "DESCRIPTION_L1",
+    "LEVEL1": "DESCRIPTION_L1",
+    "LEVEL 1": "DESCRIPTION_L1",
+    "المستوى الاول": "DESCRIPTION_L1",
+    "المستوى الأول": "DESCRIPTION_L1",
+    "وصف المستوى الاول": "DESCRIPTION_L1",
+    "وصف المستوى الأول": "DESCRIPTION_L1",
+
+    "DESCRIPTION_L2": "DESCRIPTION_L2",
+    "L2": "DESCRIPTION_L2",
+    "LEVEL2": "DESCRIPTION_L2",
+    "LEVEL 2": "DESCRIPTION_L2",
+    "المستوى الثاني": "DESCRIPTION_L2",
+    "وصف المستوى الثاني": "DESCRIPTION_L2",
+
+    "DESCRIPTION_L3": "DESCRIPTION_L3",
+    "L3": "DESCRIPTION_L3",
+    "LEVEL3": "DESCRIPTION_L3",
+    "LEVEL 3": "DESCRIPTION_L3",
+    "المستوى الثالث": "DESCRIPTION_L3",
+    "وصف المستوى الثالث": "DESCRIPTION_L3",
+
+    "DESCRIPTION_L4": "DESCRIPTION_L4",
+    "L4": "DESCRIPTION_L4",
+    "LEVEL4": "DESCRIPTION_L4",
+    "LEVEL 4": "DESCRIPTION_L4",
+    "المستوى الرابع": "DESCRIPTION_L4",
+    "وصف المستوى الرابع": "DESCRIPTION_L4",
+
+    # Manufacturer / Serial / Model
+    "MANUFACTURER_NAME": "MANUFACTURER_NAME",
+    "MANUFACTURER NAME": "MANUFACTURER_NAME",
+    "MANUFACTURER": "MANUFACTURER_NAME",
+    "الشركة المصنعة": "MANUFACTURER_NAME",
+    "المصنع": "MANUFACTURER_NAME",
+
+    "SERIAL_NUMBER": "SERIAL_NUMBER",
+    "SERIAL NUMBER": "SERIAL_NUMBER",
+    "SERIAL": "SERIAL_NUMBER",
+    "SERIAL NO": "SERIAL_NUMBER",
+    "الرقم التسلسلي": "SERIAL_NUMBER",
+    "السيريال": "SERIAL_NUMBER",
+
+    "MODEL_NUMBER": "MODEL_NUMBER",
+    "MODEL NUMBER": "MODEL_NUMBER",
+    "MODEL": "MODEL_NUMBER",
+    "MODEL NO": "MODEL_NUMBER",
+    "الموديل": "MODEL_NUMBER",
+}
+
+def normalize_key(raw_key: str) -> str:
+    k = raw_key.strip()
+    k = k.replace("_", " ").replace("-", " ")
+    k = re.sub(r"\s+", " ", k)
+    k_up = k.upper()
+
+    # Try direct Arabic/original match first, then uppercase match
+    if k in KEY_ALIASES:
+        return KEY_ALIASES[k]
+    if k_up in KEY_ALIASES:
+        return KEY_ALIASES[k_up]
+
+    # Fallback: make it uppercase with underscores
+    return k_up.replace(" ", "_")
+
+# -----------------------
+# Google Sheets client
+# -----------------------
 def get_gspread_client():
     sa_json = base64.b64decode(GOOGLE_SA_JSON_B64).decode("utf-8")
     sa_info = json.loads(sa_json)
@@ -68,11 +180,15 @@ def ensure_header(ws):
 def parse_kv(text: str) -> Dict[str, str]:
     data: Dict[str, str] = {}
     for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         m = LINE_RE.match(line)
         if not m:
             continue
-        key = m.group(1).strip().upper()
+        raw_key = m.group(1).strip()
         val = m.group(2).strip()
+        key = normalize_key(raw_key)
         data[key] = val
     return data
 
@@ -84,10 +200,14 @@ def build_row(data: Dict[str, str]) -> List[str]:
         data["DEPARTMENT"] = DEFAULT_SHEET_NAME
     return [data.get(col, "") for col in COLUMNS]
 
+# -----------------------
+# Telegram handlers
+# -----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "جاهز ✅\n"
         "ألصق نموذج الجهاز بصيغة KEY: VALUE داخل هذا القروب.\n"
+        "تقدر تستخدم عربي/انجليزي، و(:) أو (：).\n"
         "لإظهار Chat ID اكتب /id"
     )
 
@@ -110,7 +230,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = parse_kv(update.message.text)
 
-    if "TAG_NUMBER" not in data and "DESCRIPTION_AR" not in data:
+    # Only process if it looks like our template (now very loose)
+    if "TAG_NUMBER" not in data and "التاق" not in update.message.text and "رقم التاق" not in update.message.text:
         return
 
     missing = missing_required(data)
