@@ -15,14 +15,15 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 DEFAULT_SHEET_NAME = os.environ.get("DEFAULT_SHEET_NAME", "تجربة")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")  # optional
 
-# Render usually provides this automatically for Web Services
 PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", "10000"))
 
 GOOGLE_SA_JSON_B64 = os.environ["GOOGLE_SA_JSON_B64"]
 
+# ✅ أضفنا SECTION هنا
 COLUMNS = [
-    "DEPARTMENT",
+    "DEPARTMENT",          # اسم الورقة (المركز/قسم المستشفى الكبير)
+    "SECTION",             # القسم داخل الورقة (الإدارة/أسنان/تطعيمات...)
     "ROOM_ID",
     "ROOM_NAME",
     "TAG_NUMBER",
@@ -37,7 +38,7 @@ COLUMNS = [
     "MODEL_NUMBER",
 ]
 
-# Keep it minimal (very tolerant)
+# متسامح جدًا: يكفي التاق
 REQUIRED_FIELDS = ["TAG_NUMBER"]
 
 # -----------------------
@@ -47,18 +48,30 @@ SEP_CHARS = r":：﹕"  # ":" + fullwidth + common variants
 LINE_RE = re.compile(rf"^\s*([^ {SEP_CHARS}]+(?:\s+[^ {SEP_CHARS}]+)*)\s*[{SEP_CHARS}]\s*(.*)\s*$")
 
 KEY_ALIASES = {
-    # Department
+    # Worksheet name (facility / main department)
     "DEPARTMENT": "DEPARTMENT",
-    "القسم": "DEPARTMENT",
+    "المركز": "DEPARTMENT",
+    "المنشأة": "DEPARTMENT",
+    "اسم المركز": "DEPARTMENT",
+    "اسم المنشأة": "DEPARTMENT",
+
+    # Section (داخل الورقة)
+    "SECTION": "SECTION",
+    "القسم": "SECTION",
+    "قسم": "SECTION",
+    "الادارة": "SECTION",  # لو كتبها كعنوان فقط (اختياري)
+    "الإدارة": "SECTION",
 
     # Room
     "ROOM_ID": "ROOM_ID",
     "ROOM ID": "ROOM_ID",
     "رقم الغرفة": "ROOM_ID",
+    "رقم الغرفه": "ROOM_ID",
 
     "ROOM_NAME": "ROOM_NAME",
     "ROOM NAME": "ROOM_NAME",
     "اسم الغرفة": "ROOM_NAME",
+    "اسم الغرفه": "ROOM_NAME",
 
     # Tag
     "TAG_NUMBER": "TAG_NUMBER",
@@ -69,6 +82,8 @@ KEY_ALIASES = {
     "رقم التاق": "TAG_NUMBER",
     "التاق": "TAG_NUMBER",
     "تاق": "TAG_NUMBER",
+    "رقم التاق نمبر": "TAG_NUMBER",
+    "تاق نمبر": "TAG_NUMBER",
 
     # Descriptions
     "DESCRIPTION_AR": "DESCRIPTION_AR",
@@ -81,38 +96,34 @@ KEY_ALIASES = {
     "DESCRIPTION EN": "DESCRIPTION_EN",
     "DESC EN": "DESCRIPTION_EN",
     "الوصف انجليزي": "DESCRIPTION_EN",
+    "الوصف إنجليزي": "DESCRIPTION_EN",
     "وصف انجليزي": "DESCRIPTION_EN",
 
-    # Levels (many forms)
+    # Levels
     "DESCRIPTION_L1": "DESCRIPTION_L1",
     "L1": "DESCRIPTION_L1",
     "LEVEL1": "DESCRIPTION_L1",
     "LEVEL 1": "DESCRIPTION_L1",
     "المستوى الاول": "DESCRIPTION_L1",
     "المستوى الأول": "DESCRIPTION_L1",
-    "وصف المستوى الاول": "DESCRIPTION_L1",
-    "وصف المستوى الأول": "DESCRIPTION_L1",
 
     "DESCRIPTION_L2": "DESCRIPTION_L2",
     "L2": "DESCRIPTION_L2",
     "LEVEL2": "DESCRIPTION_L2",
     "LEVEL 2": "DESCRIPTION_L2",
     "المستوى الثاني": "DESCRIPTION_L2",
-    "وصف المستوى الثاني": "DESCRIPTION_L2",
 
     "DESCRIPTION_L3": "DESCRIPTION_L3",
     "L3": "DESCRIPTION_L3",
     "LEVEL3": "DESCRIPTION_L3",
     "LEVEL 3": "DESCRIPTION_L3",
     "المستوى الثالث": "DESCRIPTION_L3",
-    "وصف المستوى الثالث": "DESCRIPTION_L3",
 
     "DESCRIPTION_L4": "DESCRIPTION_L4",
     "L4": "DESCRIPTION_L4",
     "LEVEL4": "DESCRIPTION_L4",
     "LEVEL 4": "DESCRIPTION_L4",
     "المستوى الرابع": "DESCRIPTION_L4",
-    "وصف المستوى الرابع": "DESCRIPTION_L4",
 
     # Manufacturer / Serial / Model
     "MANUFACTURER_NAME": "MANUFACTURER_NAME",
@@ -141,13 +152,11 @@ def normalize_key(raw_key: str) -> str:
     k = re.sub(r"\s+", " ", k)
     k_up = k.upper()
 
-    # Try direct Arabic/original match first, then uppercase match
     if k in KEY_ALIASES:
         return KEY_ALIASES[k]
     if k_up in KEY_ALIASES:
         return KEY_ALIASES[k_up]
 
-    # Fallback: make it uppercase with underscores
     return k_up.replace(" ", "_")
 
 # -----------------------
@@ -168,7 +177,7 @@ def get_or_create_worksheet(spreadsheet, title: str):
     try:
         return spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(COLUMNS) + 5)
+        ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=len(COLUMNS) + 5)
         ws.append_row(COLUMNS, value_input_option="RAW")
         return ws
 
@@ -195,10 +204,27 @@ def parse_kv(text: str) -> Dict[str, str]:
 def missing_required(data: Dict[str, str]) -> List[str]:
     return [k for k in REQUIRED_FIELDS if not data.get(k)]
 
-def build_row(data: Dict[str, str]) -> List[str]:
+def build_row_by_header(ws, data: Dict[str, str]) -> List[str]:
+    """
+    🔥 أهم نقطة: نكتب حسب هيدر الورقة الفعلي حتى لو كانت الورقة القديمة ما فيها SECTION
+    """
+    header = ws.row_values(1)
+    if not header:
+        header = COLUMNS
+
+    # لو ما كتب DEPARTMENT نخليه DEFAULT
     if not data.get("DEPARTMENT"):
         data["DEPARTMENT"] = DEFAULT_SHEET_NAME
-    return [data.get(col, "") for col in COLUMNS]
+
+    # لو ما كتب SECTION نخليه فاضي (مسموح)
+    if not data.get("SECTION"):
+        data["SECTION"] = ""
+
+    row = []
+    for col in header:
+        col_norm = col.strip()
+        row.append(data.get(col_norm, ""))  # يعتمد على أسماء الأعمدة
+    return row
 
 # -----------------------
 # Telegram handlers
@@ -207,7 +233,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "جاهز ✅\n"
         "ألصق نموذج الجهاز بصيغة KEY: VALUE داخل هذا القروب.\n"
-        "تقدر تستخدم عربي/انجليزي، و(:) أو (：).\n"
+        "يدعم عربي/انجليزي و(:) أو (：).\n"
+        "الحد الأدنى: رقم التاق فقط.\n"
         "لإظهار Chat ID اكتب /id"
     )
 
@@ -228,10 +255,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    data = parse_kv(update.message.text)
+    text = update.message.text
+    data = parse_kv(text)
 
-    # Only process if it looks like our template (now very loose)
-    if "TAG_NUMBER" not in data and "التاق" not in update.message.text and "رقم التاق" not in update.message.text:
+    # ما يعالج إلا إذا فيه تاق بشكل واضح
+    looks_like_device = ("TAG_NUMBER" in data) or ("رقم التاق" in text) or ("Tag Number" in text) or ("التاق" in text)
+    if not looks_like_device:
         return
 
     missing = missing_required(data)
@@ -239,16 +268,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ حقول ناقصة:\n- " + "\n- ".join(missing))
         return
 
-    dept = (data.get("DEPARTMENT") or "").strip() or DEFAULT_SHEET_NAME
+    # ✅ اسم الورقة = DEPARTMENT (المركز/قسم المستشفى الكبير)
+    worksheet_name = (data.get("DEPARTMENT") or "").strip() or DEFAULT_SHEET_NAME
 
     try:
         gc = get_gspread_client()
         sh = gc.open_by_key(SPREADSHEET_ID)
-        ws = get_or_create_worksheet(sh, dept)
+        ws = get_or_create_worksheet(sh, worksheet_name)
         ensure_header(ws)
 
-        ws.append_row(build_row(data), value_input_option="RAW")
-        await update.message.reply_text(f"✅ تمت الإضافة بنجاح إلى ورقة: {dept}")
+        ws.append_row(build_row_by_header(ws, data), value_input_option="RAW")
+
+        sec = (data.get("SECTION") or "").strip()
+        if sec:
+            await update.message.reply_text(f"✅ تمت الإضافة إلى ورقة: {worksheet_name}\n📌 القسم: {sec}")
+        else:
+            await update.message.reply_text(f"✅ تمت الإضافة إلى ورقة: {worksheet_name}")
     except Exception as e:
         await update.message.reply_text(f"❌ خطأ أثناء الإضافة: {e}")
 
