@@ -20,6 +20,44 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 GOOGLE_SA_JSON_B64 = os.environ["GOOGLE_SA_JSON_B64"]
 
+# -----------------------
+# Classifications (L3 -> L2/L1) from local JSON
+# -----------------------
+CLASSIFICATIONS = {}
+
+def _norm_ar(s: str) -> str:
+    """Normalize Arabic safely (no guessing): trims + removes tatweel + normalizes spaces."""
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = s.replace("ـ", "")              # tatweel
+    s = re.sub(r"\s+", " ", s)          # collapse spaces
+    return s
+
+def load_classifications():
+    """
+    Expects classifications.json in project root.
+    Format:
+      {
+        "by_L3": { "L3": {"L1": "...", "L2": "...", "L3": "..."} },
+        "_meta": {...}
+      }
+    """
+    global CLASSIFICATIONS
+    try:
+        with open("classifications.json", "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        by_l3 = obj.get("by_L3", {})
+        # normalize keys for safer matching
+        CLASSIFICATIONS = {_norm_ar(k): v for k, v in by_l3.items()}
+        print(f"[classifications] loaded: {len(CLASSIFICATIONS)}")
+    except FileNotFoundError:
+        CLASSIFICATIONS = {}
+        print("[classifications] classifications.json not found (skip)")
+    except Exception as e:
+        CLASSIFICATIONS = {}
+        print(f"[classifications] failed to load: {e}")
+
 # ✅ أضفنا SECTION هنا
 COLUMNS = [
     "DEPARTMENT",          # اسم الورقة (المركز/قسم المستشفى الكبير)
@@ -220,6 +258,22 @@ def build_row_by_header(ws, data: Dict[str, str]) -> List[str]:
     if not data.get("SECTION"):
         data["SECTION"] = ""
 
+    # -----------------------
+    # Auto-fill L1/L2 from L3 using classifications.json
+    # If user sent only المستوى الثالث، نعبّي المستوى الثاني والأول تلقائيًا
+    # -----------------------
+    l3 = _norm_ar(data.get("DESCRIPTION_L3", ""))
+    l1 = _norm_ar(data.get("DESCRIPTION_L1", ""))
+    l2 = _norm_ar(data.get("DESCRIPTION_L2", ""))
+
+    # لا نطغى على شيء كتبه المستخدم، فقط نعبّي الناقص
+    if l3 and (not l1 or not l2):
+        hit = CLASSIFICATIONS.get(l3)
+        if hit:
+            data["DESCRIPTION_L1"] = hit.get("L1", data.get("DESCRIPTION_L1", ""))
+            data["DESCRIPTION_L2"] = hit.get("L2", data.get("DESCRIPTION_L2", ""))
+            data["DESCRIPTION_L3"] = hit.get("L3", data.get("DESCRIPTION_L3", ""))
+
     row = []
     for col in header:
         col_norm = col.strip()
@@ -290,6 +344,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not PUBLIC_URL:
         raise RuntimeError("Missing PUBLIC_URL/RENDER_EXTERNAL_URL environment variable")
+
+    # ✅ load local classifications.json once on startup
+    load_classifications()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
