@@ -2,7 +2,7 @@ import os
 import json
 import base64
 import re
-from typing import Dict, List
+from typing import Dict, List, Any, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,7 +23,19 @@ GOOGLE_SA_JSON_B64 = os.environ["GOOGLE_SA_JSON_B64"]
 # -----------------------
 # Classifications (L3 -> L2/L1) from local JSON
 # -----------------------
-CLASSIFICATIONS = {}
+CLASSIFICATIONS: Dict[str, Dict[str, str]] = {}
+
+# -----------------------
+# Synonyms (any keyword -> official L3) from local JSON
+# -----------------------
+SYNONYMS: Dict[str, Any] = {}  # value: str OR list[str]
+
+# -----------------------
+# Pending choice state (to avoid mixing devices)
+# Key = (chat_id, user_id)
+# Value = {"data": {...}, "options": [...], "worksheet_name": "...", "section": "..."}
+# -----------------------
+PENDING_CHOICES: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 def _norm_ar(s: str) -> str:
     """Normalize Arabic safely (no guessing): trims + removes tatweel + normalizes spaces."""
@@ -48,7 +60,6 @@ def load_classifications():
         with open("classifications.json", "r", encoding="utf-8") as f:
             obj = json.load(f)
         by_l3 = obj.get("by_L3", {})
-        # normalize keys for safer matching
         CLASSIFICATIONS = {_norm_ar(k): v for k, v in by_l3.items()}
         print(f"[classifications] loaded: {len(CLASSIFICATIONS)}")
     except FileNotFoundError:
@@ -57,6 +68,32 @@ def load_classifications():
     except Exception as e:
         CLASSIFICATIONS = {}
         print(f"[classifications] failed to load: {e}")
+
+def load_synonyms():
+    """
+    Expects synonyms.json in project root.
+    Format:
+      {
+        "by_synonym": {
+          "شفط": ["شفاطات", "وحدات شفط الطبية"],
+          "حاسب": "أجهزة الكمبيوتر المحمولة وأجهزة الكمبيوتر المكتبية"
+        }
+      }
+    """
+    global SYNONYMS
+    try:
+        with open("synonyms.json", "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        by_syn = obj.get("by_synonym", {})
+        # normalize synonym keys
+        SYNONYMS = {_norm_ar(k): v for k, v in by_syn.items()}
+        print(f"[synonyms] loaded: {len(SYNONYMS)}")
+    except FileNotFoundError:
+        SYNONYMS = {}
+        print("[synonyms] synonyms.json not found (skip)")
+    except Exception as e:
+        SYNONYMS = {}
+        print(f"[synonyms] failed to load: {e}")
 
 # ✅ أضفنا SECTION هنا
 COLUMNS = [
@@ -97,7 +134,7 @@ KEY_ALIASES = {
     "SECTION": "SECTION",
     "القسم": "SECTION",
     "قسم": "SECTION",
-    "الادارة": "SECTION",  # لو كتبها كعنوان فقط (اختياري)
+    "الادارة": "SECTION",
     "الإدارة": "SECTION",
 
     # Room
@@ -242,6 +279,37 @@ def parse_kv(text: str) -> Dict[str, str]:
 def missing_required(data: Dict[str, str]) -> List[str]:
     return [k for k in REQUIRED_FIELDS if not data.get(k)]
 
+def _apply_synonym_to_l3(data: Dict[str, str]) -> Tuple[Optional[List[str]], Optional[str]]:
+    """
+    If DESCRIPTION_L3 is a synonym keyword, replace it with official L3.
+    Return (options, chosen_l3):
+      - options: list of possible official L3s if ambiguous
+      - chosen_l3: official L3 if unique, else None
+    """
+    raw_l3 = _norm_ar(data.get("DESCRIPTION_L3", ""))
+    if not raw_l3:
+        return None, None
+
+    hit = SYNONYMS.get(raw_l3)
+    if not hit:
+        # no synonym mapping: leave as-is
+        return None, raw_l3
+
+    if isinstance(hit, list):
+        # ambiguous
+        options = [str(x).strip() for x in hit if str(x).strip()]
+        if options:
+            return options, None
+        return None, raw_l3
+
+    # unique mapping
+    chosen = str(hit).strip()
+    if chosen:
+        data["DESCRIPTION_L3"] = chosen
+        return None, chosen
+
+    return None, raw_l3
+
 def build_row_by_header(ws, data: Dict[str, str]) -> List[str]:
     """
     🔥 أهم نقطة: نكتب حسب هيدر الورقة الفعلي حتى لو كانت الورقة القديمة ما فيها SECTION
@@ -250,23 +318,17 @@ def build_row_by_header(ws, data: Dict[str, str]) -> List[str]:
     if not header:
         header = COLUMNS
 
-    # لو ما كتب DEPARTMENT نخليه DEFAULT
     if not data.get("DEPARTMENT"):
         data["DEPARTMENT"] = DEFAULT_SHEET_NAME
 
-    # لو ما كتب SECTION نخليه فاضي (مسموح)
     if not data.get("SECTION"):
         data["SECTION"] = ""
 
-    # -----------------------
     # Auto-fill L1/L2 from L3 using classifications.json
-    # If user sent only المستوى الثالث، نعبّي المستوى الثاني والأول تلقائيًا
-    # -----------------------
     l3 = _norm_ar(data.get("DESCRIPTION_L3", ""))
     l1 = _norm_ar(data.get("DESCRIPTION_L1", ""))
     l2 = _norm_ar(data.get("DESCRIPTION_L2", ""))
 
-    # لا نطغى على شيء كتبه المستخدم، فقط نعبّي الناقص
     if l3 and (not l1 or not l2):
         hit = CLASSIFICATIONS.get(l3)
         if hit:
@@ -277,7 +339,7 @@ def build_row_by_header(ws, data: Dict[str, str]) -> List[str]:
     row = []
     for col in header:
         col_norm = col.strip()
-        row.append(data.get(col_norm, ""))  # يعتمد على أسماء الأعمدة
+        row.append(data.get(col_norm, ""))
     return row
 
 # -----------------------
@@ -288,43 +350,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "جاهز ✅\n"
         "ألصق نموذج الجهاز بصيغة KEY: VALUE داخل هذا القروب.\n"
         "يدعم عربي/انجليزي و(:) أو (：).\n"
-        "الحد الأدنى: رقم التاق فقط.\n"
-        "لإظهار Chat ID اكتب /id"
+        "الحد الأدنى: رقم التاق فقط.\n\n"
+        "ميزة المرادفات:\n"
+        "- إذا كتبت L3 = كلمة مثل (شفط/حاسب) يحولها لـ L3 الرسمي.\n"
+        "- إذا لها أكثر من خيار: يعطيك أرقام تختار منها.\n\n"
+        "لإظهار Chat ID اكتب /id\n"
+        "لإلغاء آخر اختيار معلّق اكتب /cancel"
     )
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"CHAT_ID: {update.effective_chat.id}")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
-
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    key = (chat_id, user_id)
+    if key in PENDING_CHOICES:
+        del PENDING_CHOICES[key]
+        await update.message.reply_text("تم الإلغاء ✅")
+    else:
+        await update.message.reply_text("ما فيه شيء معلّق للإلغاء.")
 
-    if ALLOWED_CHAT_ID is not None:
-        try:
-            allowed = int(ALLOWED_CHAT_ID)
-            if chat_id != allowed:
-                return
-        except ValueError:
-            pass
-
-    text = update.message.text
-    data = parse_kv(text)
-
-    # ما يعالج إلا إذا فيه تاق بشكل واضح
-    looks_like_device = ("TAG_NUMBER" in data) or ("رقم التاق" in text) or ("Tag Number" in text) or ("التاق" in text)
-    if not looks_like_device:
-        return
-
-    missing = missing_required(data)
-    if missing:
-        await update.message.reply_text("❌ حقول ناقصة:\n- " + "\n- ".join(missing))
-        return
-
-    # ✅ اسم الورقة = DEPARTMENT (المركز/قسم المستشفى الكبير)
+async def _write_to_sheet(update: Update, data: Dict[str, str]):
     worksheet_name = (data.get("DEPARTMENT") or "").strip() or DEFAULT_SHEET_NAME
-
     try:
         gc = get_gspread_client()
         sh = gc.open_by_key(SPREADSHEET_ID)
@@ -341,16 +391,88 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ خطأ أثناء الإضافة: {e}")
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    if ALLOWED_CHAT_ID is not None:
+        try:
+            allowed = int(ALLOWED_CHAT_ID)
+            if chat_id != allowed:
+                return
+        except ValueError:
+            pass
+
+    text = update.message.text.strip()
+
+    # 1) إذا المستخدم عنده اختيار معلّق وأرسل رقم
+    key = (chat_id, user_id)
+    if key in PENDING_CHOICES:
+        m = re.fullmatch(r"\s*(\d{1,2})\s*", text)
+        if not m:
+            await update.message.reply_text("ارسل رقم الخيار فقط (مثال: 1) أو /cancel للإلغاء.")
+            return
+
+        idx = int(m.group(1))
+        pending = PENDING_CHOICES[key]
+        options = pending.get("options", [])
+        if idx < 1 or idx > len(options):
+            await update.message.reply_text("رقم غير صحيح. اختر رقم من القائمة أو /cancel.")
+            return
+
+        chosen_l3 = options[idx - 1]
+        data = pending["data"]
+        data["DESCRIPTION_L3"] = chosen_l3
+
+        # حذف التعليق قبل الكتابة
+        del PENDING_CHOICES[key]
+
+        await _write_to_sheet(update, data)
+        return
+
+    # 2) غير كذا: نعالج كنموذج جهاز
+    data = parse_kv(text)
+
+    looks_like_device = ("TAG_NUMBER" in data) or ("رقم التاق" in text) or ("Tag Number" in text) or ("التاق" in text)
+    if not looks_like_device:
+        return
+
+    missing = missing_required(data)
+    if missing:
+        await update.message.reply_text("❌ حقول ناقصة:\n- " + "\n- ".join(missing))
+        return
+
+    # ✅ تطبيق المرادفات على L3 إذا موجود
+    options, chosen = _apply_synonym_to_l3(data)
+    if options:
+        # نخزن الطلب معلّق لنفس المستخدم/القروب فقط (أمان من الخلط)
+        PENDING_CHOICES[key] = {"data": data, "options": options}
+
+        msg_lines = ["اختر المستوى الثالث الصحيح بإرسال رقم فقط:"]
+        for i, opt in enumerate(options, start=1):
+            msg_lines.append(f"{i}) {opt}")
+        msg_lines.append("\nمثال: ارسل 1")
+        msg_lines.append("للإلغاء: /cancel")
+        await update.message.reply_text("\n".join(msg_lines))
+        return
+
+    # 3) لو ما فيه تعارض: نكتب مباشرة
+    await _write_to_sheet(update, data)
+
 def main():
     if not PUBLIC_URL:
         raise RuntimeError("Missing PUBLIC_URL/RENDER_EXTERNAL_URL environment variable")
 
-    # ✅ load local classifications.json once on startup
     load_classifications()
+    load_synonyms()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_webhook(
